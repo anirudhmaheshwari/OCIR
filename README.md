@@ -1,1 +1,1 @@
-# OCR
+‘Optical Character and Image Recognition’ is to develop OCR software for handwriting and shape recognition. OCR is an Optical character recognition and is the mechanical or electronic translation of images of handwritten or typewritten text (usually captured by a scanner) into machine-editable text. We also coded for detecting shapes and recognising them.
