@@ -1,12 +1,3 @@
-
-# coding: utf-8
-
-# # Training: CNN - Char Classifier
-# Training CNN (convolutional neural network) for char classification
-
-# In[3]:
-
-
 import sys
 import numpy as np
 import pandas as pd
