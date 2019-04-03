@@ -1,0 +1,359 @@
+
+# coding: utf-8
+
+# In[ ]:
+
+
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import math
+import tensorflow as tf
+import cv2
+
+sys.path.append('src')
+from ocr.helpers import implt
+from ocr.mlhelpers import TrainingPlot
+from ocr.datahelpers import load_words_data, corresponding_shuffle
+from ocr.tfhelpers import create_cell
+
+
+get_ipython().run_line_magic('matplotlib', 'notebook')
+plt.rcParams['figure.figsize'] = (9.0, 5.0)
+
+
+# In[ ]:
+
+
+PAD = 0                           
+POS = 1                           
+NEG = 0
+
+POS_SPAN = 1                             
+POS_WEIGHT = 3                           
+
+slider_size = (60, 60)                  
+slider_step = 2
+N_INPUT = slider_size[0]*slider_size[1]  
+num_buckets = 5
+n_classes = 2                           
+
+rnn_layers = 4
+rnn_residual_layers = 2                 
+rnn_units = 256
+
+learning_rate = 1e-4
+dropout = 0.4                            
+train_set = 0.8                          
+TRAIN_STEPS = 500000                    
+TEST_ITER = 150
+LOSS_ITER = 50
+SAVE_ITER = 2000
+BATCH_SIZE = 10
+# EPOCH = 2000                          
+
+save_loc = 'models/gap-clas/RNN/Bi-RNN-new'
+
+
+# In[ ]:
+
+
+images, _, gaplines = load_words_data(
+    ['data/processed/words_gaplines/'],
+    load_gaplines=True)
+
+
+# In[ ]:
+
+
+images, gaplines = corresponding_shuffle([images, gaplines])
+
+for i in range(len(images)):
+    images[i] = cv2.copyMakeBorder(images[i],
+                                   0, 0, int(slider_size[1]/2), int(slider_size[1]/2),
+                                   cv2.BORDER_CONSTANT,
+                                   value=0)
+    gaplines[i] += int(slider_size[1] / 2)
+    
+div = int(train_set * len(images))
+
+trainImages = images[0:div]
+testImages = images[div:]
+
+trainGaplines = gaplines[0:div]
+testGaplines = gaplines[div:]
+
+print("Training images:", div)
+print("Testing images:", len(images) - div)
+
+
+# In[ ]:
+
+
+class BucketDataIterator():
+   
+    def __init__(self,
+                 images,
+                 gaplines,
+                 gap_span,
+                 num_buckets=5,
+                 slider=(60, 30),
+                 slider_step=2,
+                 imgprocess=lambda x: x,
+                 train=True):
+        
+        self.train = train
+        length = [(image.shape[1]-slider[1])//slider_step for image in images]
+    
+        
+        indices = gaplines - int(slider[1]/2)
+        indices = indices // slider_step
+        
+
+        images_seq = np.empty(len(images), dtype=object)
+        targets_seq = np.empty(len(images), dtype=object)
+        for i, img in enumerate(images):
+            images_seq[i] = [imgprocess(img[:, loc * slider_step: loc * slider_step + slider[1]].flatten())
+                             for loc in range(length[i])]
+            
+            targets_seq[i] = np.ones((length[i])) * NEG
+            for offset in range(gap_span):
+                ind = indices[i] + (-(offset % 2) * offset // 2) + ((1 - offset%2) * offset // 2) 
+                
+                if ind[0] < 0:
+                    ind[0] = 0
+                if ind[-1] >= length[i]:
+                    ind[-1] = length[i] - 1
+                    
+                targets_seq[i][ind] = POS  
+
+
+        self.dataFrame = pd.DataFrame({'length': length,
+                                       'images': images_seq,
+                                       'targets': targets_seq
+                                      }).sort_values('length').reset_index(drop=True)
+
+        bsize = int(len(images) / num_buckets)
+        self.num_buckets = num_buckets
+        
+
+        self.buckets = []
+        for bucket in range(num_buckets-1):
+            self.buckets.append(self.dataFrame.iloc[bucket * bsize: (bucket+1) * bsize])
+        self.buckets.append(self.dataFrame.iloc[(num_buckets-1) * bsize:])        
+        
+        self.buckets_size = [len(bucket) for bucket in self.buckets]
+
+
+        self.cursor = np.array([0] * num_buckets)
+        self.bucket_order = np.random.permutation(num_buckets)
+        self.bucket_cursor = 0
+        self.shuffle()
+        print("Iterator created.")
+
+
+    def shuffle(self, idx=None):
+
+        for i in [idx] if idx is not None else range(self.num_buckets):
+            self.buckets[i] = self.buckets[i].sample(frac=1).reset_index(drop=True)
+            self.cursor[i] = 0
+
+
+    def next_batch(self, batch_size):
+
+        i_bucket = self.bucket_order[self.bucket_cursor]
+
+        self.bucket_cursor = (self.bucket_cursor + 1) % self.num_buckets
+        if self.bucket_cursor == 0:
+            self.bucket_order = np.random.permutation(self.num_buckets)
+            
+        if self.cursor[i_bucket] + batch_size > self.buckets_size[i_bucket]:
+            self.shuffle(i_bucket)
+
+        if (batch_size > self.buckets_size[i_bucket]):
+            batch_size = self.buckets_size[i_bucket]
+
+        res = self.buckets[i_bucket].iloc[self.cursor[i_bucket]:
+                                          self.cursor[i_bucket]+batch_size]
+        self.cursor[i_bucket] += batch_size
+
+        max_length = max(res['length'])
+        
+        input_seq = np.zeros((batch_size, max_length, N_INPUT), dtype=np.float32)
+        for i, img in enumerate(res['images']):
+            input_seq[i][:res['length'].values[i]] = img
+        
+
+        targets = np.ones([batch_size, max_length], dtype=np.float32) * PAD
+        for i, target in enumerate(targets):
+            target[:res['length'].values[i]] = res['targets'].values[i]
+        
+        return input_seq, targets, res['length'].values
+
+
+    def next_feed(self, size):
+        """ Create feed directly for model training """
+        (inputs_,
+         targets_,
+         length_) = self.next_batch(size)
+        return {
+            inputs: inputs_,            
+            targets: targets_,
+            length: length_,
+            keep_prob: (1.0 - dropout) if self.train else 1.0
+        }
+
+
+# In[ ]:
+
+
+train_iterator = BucketDataIterator(trainImages,
+                                    trainGaplines,
+                                    POS_SPAN,
+                                    num_buckets,
+                                    slider_size,
+                                    slider_step,
+                                    train=True)
+test_iterator = BucketDataIterator(testImages,
+                                   testGaplines,
+                                   POS_SPAN,
+                                   1,
+                                   slider_size,
+                                   slider_step,
+                                   train=False)
+
+
+# In[ ]:
+
+
+inputs = tf.placeholder(shape=(None, None, N_INPUT),
+                                dtype=tf.float32,
+                                name='inputs')
+length = tf.placeholder(shape=(None,),
+                        dtype=tf.int32,
+                        name='length')
+targets = tf.placeholder(shape=(None, None),
+                         dtype=tf.int64,
+                         name='targets')
+keep_prob = tf.placeholder(tf.float32, name='keep_prob')
+
+
+# In[ ]:
+
+
+
+def conv2d(x, W, name=None):
+    return tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding='SAME', name=name)
+
+def max_pool_2x2(x, name=None):
+    return tf.nn.max_pool(x, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME', name=name)
+
+W_conv1 = tf.get_variable('W_conv1', shape=[5, 5, 1, 2],
+                          initializer=tf.contrib.layers.xavier_initializer())
+b_conv1 = tf.Variable(tf.constant(0.1, shape=[2]), name='b_conv1')
+W_conv2 = tf.get_variable('W_conv2', shape=[5, 5, 2, 4],
+                          initializer=tf.contrib.layers.xavier_initializer())
+b_conv2 = tf.Variable(tf.constant(0.1, shape=[4]), name='b_conv2')
+
+def CNN(x):
+    x = tf.image.per_image_standardization(x)
+    x = tf.reshape(x, [1, slider_size[0], slider_size[1], 1])
+    h_conv1 = tf.nn.relu(conv2d(x, W_conv1) + b_conv1, name='h_conv1')
+    h_pool1 = max_pool_2x2(h_conv1, name='h_pool1')
+    h_conv2 = tf.nn.relu(conv2d(h_pool1, W_conv2) + b_conv2, name='h_conv2')
+    return max_pool_2x2(h_conv2, name='h_pool2')
+inpts = tf.map_fn(
+    lambda seq: tf.map_fn(
+        lambda img:
+            tf.reshape(
+                CNN(tf.reshape(img, [slider_size[0], slider_size[1], 1])),
+                [-1]),
+        seq),
+    inputs,
+    dtype=tf.float32
+
+
+# In[ ]:
+
+
+cell_fw = create_cell(rnn_units,
+                      rnn_layers,
+                      rnn_residual_layers,
+                      is_dropout=True,
+                      keep_prob=keep_prob)
+cell_bw = create_cell(rnn_units,
+                      rnn_layers,
+                      rnn_residual_layers,
+                      is_dropout=True,
+                      keep_prob=keep_prob)
+
+
+# In[ ]:
+
+
+bi_outputs, _ = tf.nn.bidirectional_dynamic_rnn(
+    cell_fw = cell_fw,
+    cell_bw = cell_bw,
+    inputs = inpts,
+    sequence_length = length,
+    dtype = tf.float32)
+
+outputs = tf.concat(bi_outputs, -1, name='outputs')
+
+pred = tf.layers.dense(inputs=outputs,
+                       units=n_classes,
+                       name='pred')
+prediction = tf.argmax(pred, axis=-1, name='prediction')
+
+
+# In[ ]:
+
+
+weights = tf.multiply(targets, POS_WEIGHT) + 1
+loss = tf.reduce_mean(tf.losses.sparse_softmax_cross_entropy(
+    logits=pred,
+    labels=targets,
+    weights=weights), name='loss')
+train_step = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(loss, name='train_step')
+
+correct_pred = tf.equal(prediction, targets)
+accuracy = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
+
+
+# In[ ]:
+
+
+sess = tf.InteractiveSession()
+sess.run(tf.global_variables_initializer())
+saver = tf.train.Saver()
+
+trainPlot = TrainingPlot(TRAIN_STEPS, TEST_ITER, LOSS_ITER)
+
+try:
+    for i_batch in range(TRAIN_STEPS):
+        fd = train_iterator.next_feed(BATCH_SIZE)
+        train_step.run(fd)
+        
+        if i_batch % LOSS_ITER == 0:
+            tmpLoss = loss.eval(fd)
+            trainPlot.updateCost(tmpLoss, i_batch // LOSS_ITER)
+    
+        if i_batch % TEST_ITER == 0:
+            fd_test = test_iterator.next_feed(BATCH_SIZE)
+            accTest = accuracy.eval(fd_test)
+            accTrain = accuracy.eval(fd)
+            trainPlot.updateAcc(accTest, accTrain, i_batch // TEST_ITER)
+
+        if i_batch % SAVE_ITER == 0:
+            saver.save(sess, save_loc)
+        
+except KeyboardInterrupt:
+    saver.save(sess, save_loc)
+    print('Training interrupted, model saved.')
+
+
+fd_test = test_iterator.next_feed(2*BATCH_SIZE)
+accTest = accuracy.eval(fd_test)
+print("Training finished with accuracy:", accTest
+
